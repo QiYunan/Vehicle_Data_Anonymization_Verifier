@@ -72,7 +72,7 @@ def batch_gbt_splitter(ffmpeg_path, input_root,output_root):
 
 if __name__ == "__main__":
     ffmpeg_executable = r"E:\FFmpeg\ffmpeg-8.0.1-essentials_build\bin\ffmpeg.exe"
-    input_root_dir = r"E:\Vehicle_Data_Anonymization_Verifier\self_test_video"
-    output_root_dir = r"E:\Vehicle_Data_Anonymization_Verifier\Output_Frame"
+    input_root_dir = r"E:\Vehicle_Data_Anonymization_Verifier\self_check\unmasked\video"
+    output_root_dir = r"E:\Vehicle_Data_Anonymization_Verifier\self_check\unmasked\images"
 
 batch_gbt_splitter(ffmpeg_executable, input_root_dir, output_root_dir)
