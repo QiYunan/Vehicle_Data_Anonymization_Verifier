@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# 虚拟环境（位于项目根 E:\Vehicle_Data_Anonymization_Verifier\venv312，不入库）
+venv312/
+.venv/
+
+# 模型权重（体积大，单独下载）
+weights/*.pt
+weights/*.onnx
+
+# 检测输出 / 自检数据：均在仓库外的 E:\Vehicle_Data_Anonymization_Verifier\self_check\ 下，不入库。
+# （旧的仓库内 opencv_output_json 已弃用）
+opencv_output_json/
