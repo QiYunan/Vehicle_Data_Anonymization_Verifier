@@ -22,27 +22,28 @@ def get_video_info(ffmpeg_path, video_path):
         return None
     return None
 
-def process_single_video(ffmpeg_path, video_path, root_output_dir):
-    video_filename = os.path.splitext(os.path.basename(video_path))[0]
-    video_output_dir = os.path.join(root_output_dir, video_filename)
+def process_single_video(ffmpeg_path, video_path, root_output_dir, index=1):
+    video_output_dir = os.path.join(root_output_dir, f"{index:03d}")
     if not os.path.exists(video_output_dir):
         os.makedirs(video_output_dir)
     meta = get_video_info(ffmpeg_path, video_path)
     if meta:
         w, h, fps, duration = meta
-        print(f"\n[视频]:{os.path.basename(video_path)}")
-        print(f"分辨率: {w}x{h} | 帧率: {fps:.2f} | 时长：{duration:.2f}秒")
+        print(f"\n[{index:03d}] {os.path.basename(video_path)}")
+        print(f"    {w}x{h} | {fps:.2f}fps | {duration:.2f}s")
         
-    output_pattern = os.path.join(video_output_dir,"gbt_frame_%04d.jpg")
-    
+    # 帧文件名格式：{视频序号}_{帧序号}.jpg，例如 001_0001.jpg，全局唯一
+    frame_prefix = f"{index:03d}_"
+    output_pattern = os.path.join(video_output_dir, f"{frame_prefix}%04d.jpg")
+
     cmd = [ffmpeg_path, '-y', '-i', video_path, '-vf' , 'fps=1/2', '-vsync', 'vfr', '-q:v', '2', output_pattern]
-    
+
     result = subprocess.run(cmd, stdout = subprocess.PIPE, stderr = subprocess.PIPE, text = True)
     if result.returncode == 0:
-        count = len([f for f in os.listdir(video_output_dir) if f.startswith("gbt_frame_")])
-        print(f"抽帧成功 已存入：{video_output_dir}(共{count}帧)")
+        count = len([f for f in os.listdir(video_output_dir) if f.startswith(frame_prefix)])
+        print(f"    Done -> {video_output_dir} ({count} frames)")
     else:
-        print(f"抽帧失败 视频{os.path.basename(video_path)}发生错误")
+        print(f"    [ERROR] {os.path.basename(video_path)}")
     
 def batch_gbt_splitter(ffmpeg_path, input_root,output_root):
     print(f"请输入视频文件夹路径：{input_root}")
@@ -62,9 +63,9 @@ def batch_gbt_splitter(ffmpeg_path, input_root,output_root):
         return
         
     for index, video_path in enumerate(video_list, 1):
-        print(f"\n 视频处理进度：[{index}/{total_video}]")
+        print(f"\n[{index}/{total_video}]")
         try:
-            process_single_video(ffmpeg_path,video_path, output_root)
+            process_single_video(ffmpeg_path, video_path, output_root, index=index)
         except Exception as e:
             print(f"处理视频{video_path}时遭遇未知错误，已自动跳过。错误日志：{e}")
             traceback.print_exc()

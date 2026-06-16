@@ -60,12 +60,21 @@ def _redirect_caches_to_e():
 
 _redirect_caches_to_e()
 
+import re
+import sys
 import json
 import traceback
 from datetime import datetime
+from functools import lru_cache
 
 import cv2
 import numpy as np
+
+# Windows 控制台默认 GBK，打印车牌中文/✅ 会报错；强制 stdout 用 UTF-8。
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 
 # Windows 下 cv2.imread/imwrite 无法处理含中文（非 ASCII）的路径，
@@ -88,13 +97,74 @@ def imwrite_unicode(path, img_matrix):
     return ok
 
 
+# cv2.putText 画不了中文（车牌号），用 PIL + Windows 中文字体渲染。
+@lru_cache(maxsize=8)
+def _load_cn_font(size):
+    from PIL import ImageFont
+    for path in (r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\simhei.ttf",
+                 r"C:\Windows\Fonts\simsun.ttc"):
+        if os.path.exists(path):
+            return ImageFont.truetype(path, size)
+    return ImageFont.load_default()
+
+
+# ---- 中国车牌格式校验 ----
+# 首字为大陆省份简称（不含台/港/澳——港澳车进大陆挂「粤Z+尾字港/澳」）。
+# 末位允许特殊尾缀汉字：港澳(入境)、学(教练)、警(警车)、挂(挂车)、领/使(领馆)、试(试验)。
+_PLATE_PROVINCES = "京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼"
+_PLATE_SUFFIX = "港澳学警挂领使试"
+# 省1 + 字母1 + 4~6位字母数字 + 末位(字母数字 或 尾缀汉字) → 普通7位/新能源8位/带尾缀
+_PLATE_RE = re.compile(
+    rf"^[{_PLATE_PROVINCES}][A-Z][A-Z0-9]{{4,6}}[A-Z0-9{_PLATE_SUFFIX}]$"
+)
+
+
+def normalize_plate(text):
+    """去掉分隔符·•・.- 与空格，字母转大写。"""
+    return re.sub(r"[\s·•・.\-]", "", text or "").upper()
+
+
+def is_valid_plate(text):
+    """是否符合中国车牌格式（用于剔除 GB/T 标准号等误检、残缺读数）。"""
+    return bool(_PLATE_RE.match(normalize_plate(text)))
+
+
+def _overlap_ratio(a, b):
+    """交集面积 / 较小框面积（IoMin）。用于去重：一个框大部分落在另一个里即视为重复。"""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = (a[2] - a[0]) * (a[3] - a[1])
+    area_b = (b[2] - b[0]) * (b[3] - b[1])
+    smaller = min(area_a, area_b)
+    return inter / smaller if smaller > 0 else 0.0
+
+
+def draw_labels_cn(canvas_bgr, labels, font_size=22):
+    """在 BGR 图上批量画中文标签。labels: [(text, x, y, (B,G,R)), ...]，返回新 BGR 图。"""
+    if not labels:
+        return canvas_bgr
+    from PIL import Image, ImageDraw
+    img = Image.fromarray(cv2.cvtColor(canvas_bgr, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(img)
+    font = _load_cn_font(font_size)
+    for text, x, y, (b, g, r) in labels:
+        # 文字加深色描边底，避免在浅色车身上看不清
+        draw.text((x, y), text, font=font, fill=(r, g, b),
+                  stroke_width=2, stroke_fill=(0, 0, 0))
+    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+
 # ======================================================================
 # 一、人脸检测器（RetinaFace）
 # ======================================================================
 class FaceDetector:
     """基于 RetinaFace 的离线人脸检测。延迟加载，未安装时给出清晰提示。"""
 
-    def __init__(self, conf_threshold=0.5):
+    def __init__(self, conf_threshold=0.65):
         self.conf_threshold = conf_threshold
         self._engine = None
 
@@ -110,18 +180,44 @@ class FaceDetector:
             ) from e
         self._engine = RetinaFace
 
+    # 几何后处理过滤阈值（不改模型，只过滤形态异常的误检框）
+    _MIN_FACE_PX      = 20      # 最小边长：<20px 必为噪点
+    _MAX_AREA_RATIO   = 0.08    # 最大面积占比：>8% 画面视为异常（约407×407px@1080p）
+    _HIGH_CONF_EXEMPT = 0.90    # 置信度≥0.90时豁免面积检查，保留极近距离真实人脸
+    _ASPECT_MIN       = 0.4     # 宽/高下限：过窄的条状框不是人脸
+    _ASPECT_MAX       = 1.5     # 宽/高上限：人脸宽不超过高的1.5倍
+    _GROUND_Y_RATIO   = 0.90    # 框中心y > 90%画面高度 → 地面区域，排除
+
+    def _is_plausible_face(self, x1, y1, x2, y2, conf, img_h, img_w):
+        """几何合理性校验，排除停车场地面/纹理等环境误检。
+        置信度≥0.90时豁免面积上限，保留极近距离的真实人脸。"""
+        w, h = x2 - x1, y2 - y1
+        if min(w, h) < self._MIN_FACE_PX:
+            return False
+        if (w * h) / (img_h * img_w) > self._MAX_AREA_RATIO and conf < self._HIGH_CONF_EXEMPT:
+            return False
+        aspect = w / h if h > 0 else 0
+        if not (self._ASPECT_MIN <= aspect <= self._ASPECT_MAX):
+            return False
+        if (y1 + y2) / 2 > img_h * self._GROUND_Y_RATIO:
+            return False
+        return True
+
     def detect(self, img_matrix):
         """返回人脸列表: [{bbox:[x1,y1,x2,y2], confidence:float}, ...]"""
         self._ensure_engine()
-        # RetinaFace 接受 BGR ndarray，返回 {face_1: {facial_area, score, ...}}
+        img_h, img_w = img_matrix.shape[:2]
         raw = self._engine.detect_faces(img_matrix, threshold=self.conf_threshold)
         faces = []
         if isinstance(raw, dict):
             for info in raw.values():
                 x1, y1, x2, y2 = info["facial_area"]
+                conf = round(float(info.get("score", 1.0)), 4)
+                if not self._is_plausible_face(x1, y1, x2, y2, conf, img_h, img_w):
+                    continue
                 faces.append({
                     "bbox": [int(x1), int(y1), int(x2), int(y2)],
-                    "confidence": round(float(info.get("score", 1.0)), 4),
+                    "confidence": conf,
                 })
         return faces
 
@@ -132,10 +228,25 @@ class FaceDetector:
 class PlateDetector:
     """YOLOv8 定位车牌区域，PaddleOCR 识别车牌文字。"""
 
-    def __init__(self, yolo_weights, conf_threshold=0.4, ocr_lang="ch"):
+    # 国标 §5.6.2.1：车牌边界框最小边长 ≥16px 才属匿名化对象。
+    MIN_SIDE_PX = 16
+
+    def __init__(self, yolo_weights, conf_threshold=0.15, ocr_lang="ch",
+                 imgsz=1920, ocr_conf_threshold=0.80, min_side_px=MIN_SIDE_PX):
+        """
+        conf_threshold     : YOLO 置信度门槛（调低以多召回远处小/斜车牌）
+        imgsz              : YOLO 推理分辨率，默认 1920（YOLO 默认仅 640 会把远处小牌缩没）。
+                             实测：太高(如3200)反而会漏掉近处「过大」的车牌，1920 兼顾近/远，
+                             也正好匹配 1080p 抽帧工作流。远处小牌根治靠全分辨率源图。
+        ocr_conf_threshold : OCR 文字置信度 ≥ 此值才算「读出有效号码」
+        min_side_px        : 车牌最小边长阈值（国标 16px），用于第②层「是否符合国标」筛选
+        """
         self.yolo_weights = yolo_weights
         self.conf_threshold = conf_threshold
         self.ocr_lang = ocr_lang
+        self.imgsz = imgsz
+        self.ocr_conf_threshold = ocr_conf_threshold
+        self.min_side_px = min_side_px
         self._yolo = None
         self._ocr = None
 
@@ -193,23 +304,65 @@ class PlateDetector:
         text_conf = round(float(min(scores)), 4) if scores else 0.0
         return full_text, text_conf
 
+    def _classify(self, measured_min_side, text, text_conf):
+        """两层漏斗判定（先读号码，再看尺寸）：
+        第①层——能否读出【完整且符合中国车牌格式】的号码？读不出 → 不算车牌(unread)。
+        第②层——在能读出的车牌里，最小边长是否 ≥16px(国标5.6.2.1)？
+        - standard : 读出合法号码 且 ≥16px  → 可识别 且 符合国标
+        - small    : 读出合法号码 但 <16px  → 算车牌，但尺寸不达国标
+        - unread   : 未读出合法号码（遮挡/不清晰/非车牌误检如 GB/T）→ 不计为车牌
+        说明：被遮挡导致号码不全 → 读不出 → 自动不算车牌（契合国标"遮挡不计"）。"""
+        valid = bool(text) and text_conf >= self.ocr_conf_threshold and is_valid_plate(text)
+        if not valid:
+            return "unread"
+        return "standard" if measured_min_side >= self.min_side_px else "small"
+
     def detect(self, img_matrix):
-        """返回车牌列表: [{bbox, confidence, text, text_confidence}, ...]"""
+        """返回车牌列表: [{bbox, confidence, text, text_confidence, min_side, status}, ...]"""
         self._ensure_yolo()
-        results = self._yolo(img_matrix, conf=self.conf_threshold, verbose=False)
-        plates = []
+        # imgsz 调高 + conf 调低，显著提升远处/小/斜车牌召回。
+        results = self._yolo(img_matrix, conf=self.conf_threshold,
+                             imgsz=self.imgsz, verbose=False)
+
+        # 1) 先对每个框做 OCR，组装候选（含状态、面积、是否读出合法车牌）。
+        h_img, w_img = img_matrix.shape[:2]
+        candidates = []
         for res in results:
             for box in res.boxes:
                 x1, y1, x2, y2 = (int(v) for v in box.xyxy[0].tolist())
                 det_conf = round(float(box.conf[0]), 4)
-                crop = img_matrix[max(y1, 0):y2, max(x1, 0):x2]
+                measured_min_side = min(x2 - x1, y2 - y1)
+                # 裁切时加 8% 边距，防止 YOLO bbox 偏小导致 OCR 读到残缺车牌
+                pad_x = max(4, int((x2 - x1) * 0.08))
+                pad_y = max(4, int((y2 - y1) * 0.08))
+                crop = img_matrix[max(y1 - pad_y, 0):min(y2 + pad_y, h_img),
+                                  max(x1 - pad_x, 0):min(x2 + pad_x, w_img)]
                 text, text_conf = self._recognize_text(crop)
-                plates.append({
+                status = self._classify(measured_min_side, text, text_conf)
+                candidates.append({
                     "bbox": [x1, y1, x2, y2],
                     "confidence": det_conf,
                     "text": text,
                     "text_confidence": text_conf,
+                    "min_side": measured_min_side,
+                    "status": status,
+                    "_area": (x2 - x1) * (y2 - y1),
+                    "_valid": status != "unread",   # 读出合法车牌号(standard/small)即为真牌
                 })
+
+        # 2) 补一道去重（YOLO 自带 NMS 漏掉的嵌套重复框），保证「一块真牌 ↔ 一个框」，
+        #    否则脚本五的目标计数(项5)和框配对(项1~3)都会出错。
+        #    三级优先（前级相同才看后级）：① 读出合法车牌(_valid)
+        #    ② 文字置信度更高 ③ 框面积更大。用 IoMin>0.6 判定是否同一块牌的重复。
+        candidates.sort(key=lambda c: (c["_valid"], c["text_confidence"], c["_area"]),
+                        reverse=True)
+        plates = []
+        for c in candidates:
+            if all(_overlap_ratio(c["bbox"], k["bbox"]) <= 0.6 for k in plates):
+                plates.append(c)
+        for c in plates:
+            c.pop("_area", None)
+            c.pop("_valid", None)
         return plates
 
 
@@ -248,19 +401,31 @@ class GbtDetectionScheduler:
                     rel_paths.append(os.path.relpath(full, self.image_folder))
         return sorted(rel_paths)
 
+    # 颜色 (B,G,R)
+    _GREEN = (0, 200, 0)       # 符合国标车牌
+    _ORANGE = (0, 165, 255)    # 可识别但 <16px
+    _GREY = (150, 150, 150)    # 未读出(不算车牌)
+    _RED = (0, 0, 255)         # 人脸框
+
     def _draw_and_save(self, img_matrix, img_name, faces, plates):
         canvas = img_matrix.copy()
+        labels = []   # (text, x, y, (B,G,R))，统一用 PIL 渲染中文
         for f in faces:
             x1, y1, x2, y2 = f["bbox"]
-            cv2.rectangle(canvas, (x1, y1), (x2, y2), (0, 0, 255), 2)
-            cv2.putText(canvas, f"face {f['confidence']:.2f}", (x1, max(y1 - 6, 12)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+            cv2.rectangle(canvas, (x1, y1), (x2, y2), self._RED, 2)
+            labels.append((f"face {f['confidence']:.2f}", x1, max(y1 - 26, 2), self._RED))
         for p in plates:
             x1, y1, x2, y2 = p["bbox"]
-            cv2.rectangle(canvas, (x1, y1), (x2, y2), (0, 200, 0), 2)
-            label = f"{p['text'] or 'plate'} {p['confidence']:.2f}"
-            cv2.putText(canvas, label, (x1, max(y1 - 6, 12)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 0), 1)
+            status = p.get("status")
+            if status == "standard":          # 符合国标：绿框 + 号码
+                color, text, thick = self._GREEN, f"{p['text']}({p['text_confidence']:.2f})", 2
+            elif status == "small":           # 可识别但<16px：橙框 + 号码
+                color, text, thick = self._ORANGE, f"{p['text']} <16px({p['min_side']}px)", 2
+            else:                             # unread：灰细框，不算车牌（仅供核对漏读）
+                color, text, thick = self._GREY, "未读出(非车牌)", 1
+            cv2.rectangle(canvas, (x1, y1), (x2, y2), color, thick)
+            labels.append((text, x1, max(y1 - 26, 2), color))
+        canvas = draw_labels_cn(canvas, labels)
         viz_path = os.path.join(self.viz_folder, img_name)
         os.makedirs(os.path.dirname(viz_path), exist_ok=True)
         imwrite_unicode(viz_path, canvas)
@@ -279,6 +444,16 @@ class GbtDetectionScheduler:
         if self.save_visualization:
             self._draw_and_save(img_matrix, img_name, faces, plates)
 
+        # 两层漏斗：
+        #  第①层 可识别车牌 = 读出合法号码（standard + small）
+        #  第②层 符合国标车牌 = 可识别车牌里 ≥16px（standard）
+        recognizable = [p for p in plates if p.get("status") in ("standard", "small")]
+        standard = [p for p in plates if p.get("status") == "standard"]
+        unread = [p for p in plates if p.get("status") == "unread"]
+
+        recognizable_plates = [{"text": p["text"], "min_side": p["min_side"]} for p in recognizable]
+        standard_plates = [{"text": p["text"], "min_side": p["min_side"]} for p in standard]
+
         return {
             "image_name": img_name,
             "image_path": full_path,
@@ -286,10 +461,28 @@ class GbtDetectionScheduler:
             "height": height,
             "detect_time": datetime.now().isoformat(timespec="seconds"),
             "face_count": len(faces),
-            "plate_count": len(plates),
+            # 第①层：可识别车牌（读出合法号码）
+            "recognizable_plate_count": len(recognizable),
+            "recognizable_plates": recognizable_plates,
+            # 第②层：符合国标车牌（可识别 且 ≥16px）
+            "standard_plate_count": len(standard),
+            "standard_plates": standard_plates,
+            # 未读出有效号码的框（不计为车牌，仅供核对算法漏读/误检）
+            "unread_box_count": len(unread),
             "faces": faces,
-            "plates": plates,
+            "plates": recognizable,   # 仅确认为车牌（读出号码）的，供脚本五比对
+            "unread_boxes": unread,
         }
+
+    @staticmethod
+    def _fmt_plates(plate_list):
+        """格式化车牌列表为 '苏U·XA512(45px) | 苏X·1234(12px,<16px不达国标)'。"""
+        parts = []
+        for p in plate_list:
+            tag = f"{p['text']}({p['min_side']}px"
+            tag += ",<16px不达国标)" if p["min_side"] < PlateDetector.MIN_SIDE_PX else ")"
+            parts.append(tag)
+        return " | ".join(parts)
 
     def run(self):
         image_files = self._list_images()
@@ -298,6 +491,7 @@ class GbtDetectionScheduler:
         if total == 0:
             return
 
+        summary = []   # (img_name, recognizable_plates, standard_plates) 全局汇总
         for index, img_name in enumerate(image_files, 1):
             print(f"\n[检测进度 {index}/{total}] {img_name}")
             try:
@@ -314,10 +508,25 @@ class GbtDetectionScheduler:
             os.makedirs(os.path.dirname(json_path), exist_ok=True)
             with open(json_path, "w", encoding="utf-8") as fp:
                 json.dump(record, fp, ensure_ascii=False, indent=2)
-            print(f"  人脸 {record['face_count']} 个 | 车牌 {record['plate_count']} 个"
-                  f" -> {json_name}")
 
-        print("\n" + "=" * 60 + "\n 识别检测任务已完成！")
+            rec, std = record["recognizable_plates"], record["standard_plates"]
+            print(f"  人脸 {record['face_count']} 个 | "
+                  f"①可识别车牌 {record['recognizable_plate_count']} 个 | "
+                  f"②符合国标(≥16px) {record['standard_plate_count']} 个 | "
+                  f"未读出框 {record['unread_box_count']} 个 -> {json_name}")
+            if rec:
+                print("     ① 可识别车牌: " + self._fmt_plates(rec))
+            if std:
+                print("     ② 符合国标车牌: " + self._fmt_plates(std))
+            summary.append((img_name, rec, std))
+
+        print("\n" + "=" * 64 + "\n 识别检测任务已完成！汇总（每张图）：")
+        print(" 说明：①可识别=读出合法车牌号；②符合国标=①里最小边长≥16px(国标§5.6.2.1)。未读出框不计为车牌。")
+        print(" 号码后 (N px) = 该车牌边界框最小边长(宽、高中较小者)；标注 <16px 者不达国标尺寸。")
+        for img_name, rec, std in summary:
+            print(f"\n  {img_name}")
+            print("    ① 可识别车牌: " + (self._fmt_plates(rec) if rec else "无"))
+            print("    ② 符合国标车牌: " + (self._fmt_plates(std) if std else "无"))
 
 
 if __name__ == "__main__":
