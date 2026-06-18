@@ -6,13 +6,21 @@
 
 检测模型栈（方案A · 准确率优先，全离线）：
     人脸检测  ->  RetinaFace
-    车牌定位  ->  YOLOv8 (license-plate)
+    车牌定位  ->  YOLOv8 (license-plate)  [主检测器]
     车牌识别  ->  PaddleOCR (中文车牌)
+    大角度车牌 -> we0091234 (YOLOv5+关键点+透视矫正+CRNN)  [副检测器，兜底]
 
 OpenCV 仅用于图像 I/O、坐标绘制与结果可视化。
 """
 
 import os
+import sys
+
+# 将 we0091234 的中文车牌识别仓库加入 Python 路径（副检测器依赖）
+_CHINESE_PLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "chinese_plate_recognition")
+if _CHINESE_PLATE_DIR not in sys.path:
+    sys.path.insert(0, _CHINESE_PLATE_DIR)
 
 # ======================================================================
 # ⚠️ 强制缓存重定向（必须在导入任何 AI 框架之前执行）
@@ -231,8 +239,12 @@ class PlateDetector:
     # 国标 §5.6.2.1：车牌边界框最小边长 ≥16px 才属匿名化对象。
     MIN_SIDE_PX = 16
 
+    # 旋转暴力搜索角度（0° 已在正向 OCR 中尝试过，此处只补偿倾斜）
+    _ROTATION_ANGLES = (-30, -20, -10, 10, 20, 30)
+
     def __init__(self, yolo_weights, conf_threshold=0.15, ocr_lang="ch",
-                 imgsz=1920, ocr_conf_threshold=0.80, min_side_px=MIN_SIDE_PX):
+                 imgsz=1920, ocr_conf_threshold=0.80, min_side_px=MIN_SIDE_PX,
+                 enable_rotation_search=True):
         """
         conf_threshold     : YOLO 置信度门槛（调低以多召回远处小/斜车牌）
         imgsz              : YOLO 推理分辨率，默认 1920（YOLO 默认仅 640 会把远处小牌缩没）。
@@ -240,6 +252,7 @@ class PlateDetector:
                              也正好匹配 1080p 抽帧工作流。远处小牌根治靠全分辨率源图。
         ocr_conf_threshold : OCR 文字置信度 ≥ 此值才算「读出有效号码」
         min_side_px        : 车牌最小边长阈值（国标 16px），用于第②层「是否符合国标」筛选
+        enable_rotation_search : 对 unread 框启用旋转暴力搜索（-30°~+30°，10°步长）
         """
         self.yolo_weights = yolo_weights
         self.conf_threshold = conf_threshold
@@ -247,6 +260,7 @@ class PlateDetector:
         self.imgsz = imgsz
         self.ocr_conf_threshold = ocr_conf_threshold
         self.min_side_px = min_side_px
+        self.enable_rotation_search = enable_rotation_search
         self._yolo = None
         self._ocr = None
 
@@ -304,6 +318,34 @@ class PlateDetector:
         text_conf = round(float(min(scores)), 4) if scores else 0.0
         return full_text, text_conf
 
+    @staticmethod
+    def _rotate_crop(crop, angle):
+        """将裁切图绕中心旋转 angle 度，画布自动扩展以避免截断。"""
+        h, w = crop.shape[:2]
+        cx, cy = w / 2, h / 2
+        M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
+        cos_a, sin_a = abs(M[0, 0]), abs(M[0, 1])
+        new_w = int(h * sin_a + w * cos_a)
+        new_h = int(h * cos_a + w * sin_a)
+        M[0, 2] += (new_w - w) / 2
+        M[1, 2] += (new_h - h) / 2
+        return cv2.warpAffine(crop, M, (new_w, new_h),
+                              borderMode=cv2.BORDER_REPLICATE)
+
+    def _try_rotated_ocr(self, crop):
+        """对裁切图在 _ROTATION_ANGLES 各角度旋转后重试 OCR。
+        返回 (text, text_conf, angle)；全部失败时返回 ("", 0.0, 0)。"""
+        best_text, best_conf, best_angle = "", 0.0, 0
+        for angle in self._ROTATION_ANGLES:
+            rotated = self._rotate_crop(crop, angle)
+            text, conf = self._recognize_text(rotated)
+            if conf >= self.ocr_conf_threshold and is_valid_plate(text):
+                if conf > best_conf:
+                    best_text, best_conf, best_angle = text, conf, angle
+                    if conf >= 0.90:
+                        break
+        return best_text, best_conf, best_angle
+
     def _classify(self, measured_min_side, text, text_conf):
         """两层漏斗判定（先读号码，再看尺寸）：
         第①层——能否读出【完整且符合中国车牌格式】的号码？读不出 → 不算车牌(unread)。
@@ -350,19 +392,109 @@ class PlateDetector:
                     "_valid": status != "unread",   # 读出合法车牌号(standard/small)即为真牌
                 })
 
+        # 1.5) 对 unread 框启用旋转暴力搜索：在 -30°~+30° 逐角度旋转裁切图重跑 OCR，
+        #       尝试挽救 YOLO 检测到形状但正向 OCR 因倾斜失败的车牌（如实测 006 帧）。
+        if self.enable_rotation_search:
+            for c in candidates:
+                if c["status"] != "unread":
+                    continue
+                x1, y1, x2, y2 = c["bbox"]
+                pad_x = max(4, int((x2 - x1) * 0.08))
+                pad_y = max(4, int((y2 - y1) * 0.08))
+                crop = img_matrix[max(y1 - pad_y, 0):min(y2 + pad_y, h_img),
+                                  max(x1 - pad_x, 0):min(x2 + pad_x, w_img)]
+                text, text_conf, angle = self._try_rotated_ocr(crop)
+                if text:
+                    c["text"] = text
+                    c["text_confidence"] = text_conf
+                    c["status"] = self._classify(c["min_side"], text, text_conf)
+                    c["_valid"] = c["status"] != "unread"
+                    c["rotation_angle"] = angle
+                    print(f"     旋转矫正成功: {text} (角度{angle:+d}°, conf={text_conf:.2f})")
+
         # 2) 补一道去重（YOLO 自带 NMS 漏掉的嵌套重复框），保证「一块真牌 ↔ 一个框」，
         #    否则脚本五的目标计数(项5)和框配对(项1~3)都会出错。
         #    三级优先（前级相同才看后级）：① 读出合法车牌(_valid)
-        #    ② 文字置信度更高 ③ 框面积更大。用 IoMin>0.6 判定是否同一块牌的重复。
+        #    ② 文字置信度更高 ③ 框面积更大。用 IoMin>0.75 判定是否同一块牌的重复。
         candidates.sort(key=lambda c: (c["_valid"], c["text_confidence"], c["_area"]),
                         reverse=True)
         plates = []
         for c in candidates:
-            if all(_overlap_ratio(c["bbox"], k["bbox"]) <= 0.6 for k in plates):
+            if all(_overlap_ratio(c["bbox"], k["bbox"]) <= 0.75 for k in plates):
                 plates.append(c)
         for c in plates:
             c.pop("_area", None)
             c.pop("_valid", None)
+        return plates
+
+
+# ======================================================================
+# 二-B、大角度车牌副检测器（we0091234: YOLOv5 关键点 + 透视矫正 + CRNN）
+# ======================================================================
+class AnglePlateDetector:
+    """大角度车牌兜底检测器。
+    使用 we0091234/Chinese_license_plate_detection_recognition 的完整流水线：
+    YOLOv5（带四角关键点）→ four_point_transform 透视矫正 → CRNN 字符识别。
+    专门处理主检测器（YOLO+PaddleOCR）漏检或读不出的极端倾角车牌。"""
+
+    def __init__(self, detect_weights=None, rec_weights=None, img_size=640):
+        base = os.path.join(_CHINESE_PLATE_DIR, "weights")
+        self.detect_weights = detect_weights or os.path.join(base, "plate_detect.pt")
+        self.rec_weights = rec_weights or os.path.join(base, "plate_rec_color.pth")
+        self.img_size = img_size
+        self._detect_model = None
+        self._rec_model = None
+        self._device = None
+        self._infer_fn = None
+
+    def _ensure_models(self):
+        if self._detect_model is not None:
+            return
+        import torch
+        from models.experimental import attempt_load
+        from plate_recognition.plate_rec import init_model
+
+        self._device = torch.device("cpu")
+        self._detect_model = attempt_load(self.detect_weights,
+                                          map_location=self._device)
+        self._detect_model.eval()
+        self._rec_model = init_model(self._device, self.rec_weights,
+                                     is_color=True)
+        from detect_plate import detect_Recognition_plate
+        self._infer_fn = detect_Recognition_plate
+
+    def detect(self, img_matrix):
+        """返回与 PlateDetector.detect() 相同格式的列表，便于合并去重。"""
+        self._ensure_models()
+        raw_list = self._infer_fn(self._detect_model, img_matrix,
+                                  self._device, self._rec_model,
+                                  self.img_size, is_color=True)
+        plates = []
+        for r in raw_list:
+            x1, y1, x2, y2 = r["rect"]
+            text = r.get("plate_no", "")
+            rec_scores = r.get("rec_conf", 0.0)
+            try:
+                text_conf = round(float(np.min(rec_scores)), 4)
+            except (TypeError, ValueError):
+                text_conf = 0.0
+            det_conf = round(float(r.get("detect_conf", 0.0)), 4)
+            measured_min_side = min(x2 - x1, y2 - y1)
+            norm_text = normalize_plate(text)
+            valid = bool(norm_text) and is_valid_plate(norm_text)
+            if valid:
+                status = "standard" if measured_min_side >= PlateDetector.MIN_SIDE_PX else "small"
+            else:
+                status = "unread"
+            plates.append({
+                "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                "confidence": det_conf,
+                "text": norm_text if valid else text,
+                "text_confidence": text_conf,
+                "min_side": measured_min_side,
+                "status": status,
+                "source": "angle_plate",
+            })
         return plates
 
 
@@ -375,14 +507,17 @@ class GbtDetectionScheduler:
     def __init__(self, image_folder, output_json_folder,
                  enable_face=True, enable_plate=True,
                  yolo_weights="weights/license_plate_yolov8.pt",
-                 save_visualization=True):
+                 save_visualization=True,
+                 enable_angle_plate=True,
+                 viz_folder=None):
         self.image_folder = image_folder
         self.output_json_folder = output_json_folder
         self.save_visualization = save_visualization
-        self.viz_folder = os.path.join(output_json_folder, "visualization")
+        self.viz_folder = viz_folder or os.path.join(output_json_folder, "visualization")
 
         self.face_detector = FaceDetector() if enable_face else None
         self.plate_detector = PlateDetector(yolo_weights) if enable_plate else None
+        self.angle_plate_detector = AnglePlateDetector() if enable_angle_plate else None
 
         os.makedirs(self.output_json_folder, exist_ok=True)
         if self.save_visualization:
@@ -430,6 +565,24 @@ class GbtDetectionScheduler:
         os.makedirs(os.path.dirname(viz_path), exist_ok=True)
         imwrite_unicode(viz_path, canvas)
 
+    @staticmethod
+    def _merge_plates(primary, secondary):
+        """合并主/副检测器结果，用 IoMin 去重：同一块牌只保留读出号码且置信度更高的。"""
+        merged = list(primary)
+        for s in secondary:
+            is_dup = False
+            for i, m in enumerate(merged):
+                if _overlap_ratio(s["bbox"], m["bbox"]) > 0.75:
+                    is_dup = True
+                    s_valid = s.get("status") != "unread"
+                    m_valid = m.get("status") != "unread"
+                    if (s_valid, s.get("text_confidence", 0)) > (m_valid, m.get("text_confidence", 0)):
+                        merged[i] = s
+                    break
+            if not is_dup:
+                merged.append(s)
+        return merged
+
     def _detect_one(self, img_name):
         full_path = os.path.join(self.image_folder, img_name)
         img_matrix = imread_unicode(full_path)
@@ -440,6 +593,21 @@ class GbtDetectionScheduler:
         height, width = img_matrix.shape[:2]
         faces = self.face_detector.detect(img_matrix) if self.face_detector else []
         plates = self.plate_detector.detect(img_matrix) if self.plate_detector else []
+
+        # 副检测器（大角度透视矫正）：独立跑一遍，合并去重
+        if self.angle_plate_detector:
+            try:
+                angle_plates = self.angle_plate_detector.detect(img_matrix)
+                if angle_plates:
+                    new_count = 0
+                    before = len([p for p in plates if p.get("status") != "unread"])
+                    plates = self._merge_plates(plates, angle_plates)
+                    after = len([p for p in plates if p.get("status") != "unread"])
+                    new_count = after - before
+                    if new_count > 0:
+                        print(f"     副检测器(透视矫正)新增 {new_count} 个车牌")
+            except Exception as e:
+                print(f"     副检测器异常(不影响主流程): {e}")
 
         if self.save_visualization:
             self._draw_and_save(img_matrix, img_name, faces, plates)
@@ -530,13 +698,20 @@ class GbtDetectionScheduler:
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="GBT 44464 脚本二 · 识别检测")
+    parser.add_argument("--input", default=None, help="待检图片目录")
+    parser.add_argument("--output-json", default=None, help="JSON 输出目录")
+    parser.add_argument("--output-viz", default=None, help="可视化输出目录")
+    args = parser.parse_args()
+
     print("=" * 60)
     print(" GBT 44464-2024 脚本二 · 识别检测程序启动")
     print("=" * 60)
 
-    # 自检·未打码图片（考核项1~5）。若要检测已打码图（项6~7），把 unmasked 改成 masked。
-    SRC_IMAGE_DIR = r"E:\Vehicle_Data_Anonymization_Verifier\self_check\unmasked\images"
-    OUTPUT_JSON_DIR = r"E:\Vehicle_Data_Anonymization_Verifier\self_check\detection_json"
+    SRC_IMAGE_DIR = args.input or r"E:\Vehicle_Data_Anonymization_Verifier\self_check\unmasked\images"
+    OUTPUT_JSON_DIR = args.output_json or r"E:\Vehicle_Data_Anonymization_Verifier\self_check\detection_json"
+    OUTPUT_VIZ_DIR = args.output_viz
     YOLO_PLATE_WEIGHTS = r"weights\license_plate_yolov8.pt"
 
     scheduler = GbtDetectionScheduler(
@@ -546,5 +721,6 @@ if __name__ == "__main__":
         enable_plate=True,
         yolo_weights=YOLO_PLATE_WEIGHTS,
         save_visualization=True,
+        viz_folder=OUTPUT_VIZ_DIR,
     )
     scheduler.run()

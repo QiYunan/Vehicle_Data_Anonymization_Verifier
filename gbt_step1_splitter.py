@@ -23,25 +23,23 @@ def get_video_info(ffmpeg_path, video_path):
     return None
 
 def process_single_video(ffmpeg_path, video_path, root_output_dir, index=1):
-    video_output_dir = os.path.join(root_output_dir, f"{index:03d}")
-    if not os.path.exists(video_output_dir):
-        os.makedirs(video_output_dir)
+    if not os.path.exists(root_output_dir):
+        os.makedirs(root_output_dir)
     meta = get_video_info(ffmpeg_path, video_path)
     if meta:
         w, h, fps, duration = meta
         print(f"\n[{index:03d}] {os.path.basename(video_path)}")
         print(f"    {w}x{h} | {fps:.2f}fps | {duration:.2f}s")
-        
-    # 帧文件名格式：{视频序号}_{帧序号}.jpg，例如 001_0001.jpg，全局唯一
+
     frame_prefix = f"{index:03d}_"
-    output_pattern = os.path.join(video_output_dir, f"{frame_prefix}%04d.jpg")
+    output_pattern = os.path.join(root_output_dir, f"{frame_prefix}%04d.jpg")
 
     cmd = [ffmpeg_path, '-y', '-i', video_path, '-vf' , 'fps=1/2', '-vsync', 'vfr', '-q:v', '2', output_pattern]
 
     result = subprocess.run(cmd, stdout = subprocess.PIPE, stderr = subprocess.PIPE, text = True)
     if result.returncode == 0:
-        count = len([f for f in os.listdir(video_output_dir) if f.startswith(frame_prefix)])
-        print(f"    Done -> {video_output_dir} ({count} frames)")
+        count = len([f for f in os.listdir(root_output_dir) if f.startswith(frame_prefix)])
+        print(f"    Done -> {root_output_dir} ({count} frames)")
     else:
         print(f"    [ERROR] {os.path.basename(video_path)}")
     
@@ -71,9 +69,33 @@ def batch_gbt_splitter(ffmpeg_path, input_root,output_root):
             traceback.print_exc()
     print("\n" + "="*50 + "\n 自动化抽帧任务已完成！")
 
+def _next_run_dir():
+    """在 detection_result/ 下生成下一个 run_N_日期时间 目录名。"""
+    from datetime import datetime
+    base = r"E:\Vehicle_Data_Anonymization_Verifier\self_check\detection_result"
+    os.makedirs(base, exist_ok=True)
+    max_n = 0
+    for name in os.listdir(base):
+        if name.startswith("run_") and os.path.isdir(os.path.join(base, name)):
+            parts = name.split("_")
+            if len(parts) >= 2 and parts[1].isdigit():
+                max_n = max(max_n, int(parts[1]))
+    run_name = f"run_{max_n + 1}_{datetime.now().strftime('%Y%m%d_%H%M')}"
+    return os.path.join(base, run_name)
+
+
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="GBT 44464 脚本一 · 合规抽帧")
+    parser.add_argument("--output", default=None, help="抽帧输出目录（默认自动生成带时间戳的 run 目录）")
+    args = parser.parse_args()
+
     ffmpeg_executable = r"E:\FFmpeg\ffmpeg-8.0.1-essentials_build\bin\ffmpeg.exe"
     input_root_dir = r"E:\Vehicle_Data_Anonymization_Verifier\self_check\unmasked\video"
-    output_root_dir = r"E:\Vehicle_Data_Anonymization_Verifier\self_check\unmasked\images"
 
-batch_gbt_splitter(ffmpeg_executable, input_root_dir, output_root_dir)
+    if args.output:
+        output_root_dir = args.output
+    else:
+        output_root_dir = os.path.join(_next_run_dir(), "images")
+
+    batch_gbt_splitter(ffmpeg_executable, input_root_dir, output_root_dir)
