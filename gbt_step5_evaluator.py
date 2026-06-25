@@ -313,9 +313,9 @@ if __name__ == "__main__":
     print("=" * 64)
 
     # labelme 真值 .json 默认存图片旁，故 GT_DIR = 待检图片目录（与脚本二 SRC 同一个）。
-    GT_DIR = r"E:\Vehicle_Data_Anonymization_Verifier\self_check\unmasked\images"
-    DET_DIR = r"E:\Vehicle_Data_Anonymization_Verifier\self_check\detection_json"
-    REPORT = r"E:\Vehicle_Data_Anonymization_Verifier\self_check\report\self_check_report.json"
+    GT_DIR = r"E:\Vehicle_Data_Anonymization_Verifier\test\sample\image"
+    DET_DIR = r"E:\Vehicle_Data_Anonymization_Verifier\test\detection_json"
+    REPORT = r"E:\Vehicle_Data_Anonymization_Verifier\test\report\self_check_report.json"
 
     evaluator = GbtSelfCheckEvaluator(
         gt_folder=GT_DIR,
