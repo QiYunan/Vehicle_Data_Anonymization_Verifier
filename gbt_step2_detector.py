@@ -170,11 +170,14 @@ def draw_labels_cn(canvas_bgr, labels, font_size=22):
 # 一、人脸检测器（RetinaFace）
 # ======================================================================
 class FaceDetector:
-    """基于 RetinaFace 的离线人脸检测。延迟加载，未安装时给出清晰提示。"""
+    """基于 RetinaFace 的离线人脸检测。延迟加载，未安装时给出清晰提示。
+    人脸框用 SPIGA(98点) 矫正为国标 §3.5 定义；SPIGA 不可用时退回比例法。"""
 
-    def __init__(self, conf_threshold=0.65):
+    def __init__(self, conf_threshold=0.65, use_spiga=True):
         self.conf_threshold = conf_threshold
         self._engine = None
+        self.use_spiga = use_spiga
+        self._spiga = None
 
     def _ensure_engine(self):
         if self._engine is not None:
@@ -187,6 +190,17 @@ class FaceDetector:
                 "（需 Python<=3.12 与 tensorflow 支持）"
             ) from e
         self._engine = RetinaFace
+
+    def _ensure_spiga(self):
+        """懒加载 SPIGA 关键点器；失败则关闭 SPIGA、回退比例法。"""
+        if self._spiga is not None or not self.use_spiga:
+            return
+        try:
+            from spiga_face_landmarks import SpigaLandmarker
+            self._spiga = SpigaLandmarker("wflw")
+        except Exception as e:
+            print(f"[WARN] SPIGA 不可用，回退比例法估计眉线: {e}")
+            self.use_spiga = False
 
     # 几何后处理过滤阈值（不改模型，只过滤形态异常的误检框）
     _MIN_FACE_PX      = 20      # 最小边长：<20px 必为噪点
@@ -211,9 +225,32 @@ class FaceDetector:
             return False
         return True
 
+    # 国标 §3.5：人脸目标 = 眉毛最上端→颏底线、左耳→右耳(不含耳)。
+    # 首选 SPIGA(98点) 直接量出三边；SPIGA 不可用时用下面的比例法兜底
+    # （RetinaFace 只有 5 点不含眉毛，眉线只能用 眼→嘴距 估计，精度有限）。
+    _EYEBROW_ALPHA = 0.25
+
+    def _to_gbt_face_box_ratio(self, facial_area, landmarks):
+        """兜底：用 RetinaFace 5 点把顶边下移到眉毛（比例估计），其余沿用 facial_area。"""
+        x1, y1, x2, y2 = (float(v) for v in facial_area)
+        try:
+            le, re = landmarks["left_eye"], landmarks["right_eye"]
+            ml, mr = landmarks["mouth_left"], landmarks["mouth_right"]
+            eye_y = (le[1] + re[1]) / 2.0
+            mouth_y = (ml[1] + mr[1]) / 2.0
+            d = mouth_y - eye_y
+            if d > 0:
+                brow_y = eye_y - self._EYEBROW_ALPHA * d
+                y1 = min(max(brow_y, y1), eye_y)
+        except (KeyError, TypeError, IndexError):
+            pass
+        return [int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))]
+
     def detect(self, img_matrix):
-        """返回人脸列表: [{bbox:[x1,y1,x2,y2], confidence:float}, ...]"""
+        """返回人脸列表: [{bbox:[x1,y1,x2,y2], confidence:float}, ...]
+        bbox 已矫正为国标 §3.5 定义（眉毛最上沿→颏底线、耳间不含耳）。"""
         self._ensure_engine()
+        self._ensure_spiga()
         img_h, img_w = img_matrix.shape[:2]
         raw = self._engine.detect_faces(img_matrix, threshold=self.conf_threshold)
         faces = []
@@ -221,12 +258,15 @@ class FaceDetector:
             for info in raw.values():
                 x1, y1, x2, y2 = info["facial_area"]
                 conf = round(float(info.get("score", 1.0)), 4)
+                # 形态过滤在原始 facial_area 上做（阈值按其调），通过后再矫正输出框
                 if not self._is_plausible_face(x1, y1, x2, y2, conf, img_h, img_w):
                     continue
-                faces.append({
-                    "bbox": [int(x1), int(y1), int(x2), int(y2)],
-                    "confidence": conf,
-                })
+                bbox = None
+                if self.use_spiga and self._spiga is not None:
+                    bbox = self._spiga.gbt_face_box(img_matrix, info["facial_area"])
+                if bbox is None:  # SPIGA 未启用或本框失败 → 比例法兜底
+                    bbox = self._to_gbt_face_box_ratio(info["facial_area"], info.get("landmarks", {}))
+                faces.append({"bbox": bbox, "confidence": conf})
         return faces
 
 
@@ -709,8 +749,8 @@ if __name__ == "__main__":
     print(" GBT 44464-2024 脚本二 · 识别检测程序启动")
     print("=" * 60)
 
-    SRC_IMAGE_DIR = args.input or r"E:\Vehicle_Data_Anonymization_Verifier\self_check\unmasked\images"
-    OUTPUT_JSON_DIR = args.output_json or r"E:\Vehicle_Data_Anonymization_Verifier\self_check\detection_json"
+    SRC_IMAGE_DIR = args.input or r"E:\Vehicle_Data_Anonymization_Verifier\test\sample\image"
+    OUTPUT_JSON_DIR = args.output_json or r"E:\Vehicle_Data_Anonymization_Verifier\test\detection_json"
     OUTPUT_VIZ_DIR = args.output_viz
     YOLO_PLATE_WEIGHTS = r"weights\license_plate_yolov8.pt"
 

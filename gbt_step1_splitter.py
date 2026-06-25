@@ -72,7 +72,7 @@ def batch_gbt_splitter(ffmpeg_path, input_root,output_root):
 def _next_run_dir():
     """在 detection_result/ 下生成下一个 run_N_日期时间 目录名。"""
     from datetime import datetime
-    base = r"E:\Vehicle_Data_Anonymization_Verifier\self_check\detection_result"
+    base = r"E:\Vehicle_Data_Anonymization_Verifier\test\detection_result"
     os.makedirs(base, exist_ok=True)
     max_n = 0
     for name in os.listdir(base):
@@ -91,7 +91,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     ffmpeg_executable = r"E:\FFmpeg\ffmpeg-8.0.1-essentials_build\bin\ffmpeg.exe"
-    input_root_dir = r"E:\Vehicle_Data_Anonymization_Verifier\self_check\unmasked\video"
+    input_root_dir = r"E:\Vehicle_Data_Anonymization_Verifier\test\sample\video"
 
     if args.output:
         output_root_dir = args.output

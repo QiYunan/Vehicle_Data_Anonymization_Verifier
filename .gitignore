@@ -10,6 +10,6 @@ venv312/
 weights/*.pt
 weights/*.onnx
 
-# 检测输出 / 自检数据：均在仓库外的 E:\Vehicle_Data_Anonymization_Verifier\self_check\ 下，不入库。
+# 检测输出 / 测试数据：均在仓库外的 E:\Vehicle_Data_Anonymization_Verifier\test\ 下，不入库。
 # （旧的仓库内 opencv_output_json 已弃用）
 opencv_output_json/

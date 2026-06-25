@@ -1,7 +1,9 @@
 # 项目上下文交接文档
 
 > 供切换 AI 模型 / 会话时快速恢复上下文。
-> **最后更新**：2026-06-16
+> **最后更新**：2026-06-23
+
+> ⚠️ **测试原则：一律用真实数据测试，绝不用人为编造的样本——编造数据测试没有意义。**
 
 ---
 
@@ -199,38 +201,47 @@
 - **解释器**：Python 3.12.8，装在 `E:\Python312`（系统默认的 3.14/3.13 装不了 Paddle）
 - **虚拟环境**：`E:\Vehicle_Data_Anonymization_Verifier\venv312`
   运行脚本二：`E:\Vehicle_Data_Anonymization_Verifier\venv312\Scripts\python.exe gbt_step2_detector.py`
-- **已装库**：ultralytics 8.4 / paddlepaddle 3.3.1 / paddleocr 3.7 / retina-face 0.0.18 / tf-keras / opencv / torch 2.12 / tensorflow 2.21
-- **模型缓存**：全部强制落 `E:\Vehicle_Data_Anonymization_Verifier\model_cache\`（C 盘已满，严禁写 C）
+- **已装库**：ultralytics 8.4 / paddlepaddle 3.3.1 / paddleocr 3.7 / retina-face 0.0.18 / tf-keras / opencv / **torch 2.12.0+cu126 / torchvision 0.27.0+cu126**（GPU 版）/ tensorflow 2.21 / **spiga 0.0.6**
+- **GPU（2026-06-24 启用）**：RTX 4060 Laptop 8GB，驱动 555.97/CUDA12.5；torch 用 cu126（次版本兼容 12.5 驱动，无需升级）。`torch.cuda.is_available()=True`。
+  - **上 GPU**：YOLO 车牌、SPIGA 人脸关键点、CRNN（均 torch）。**仍 CPU**：RetinaFace（TF，Win 无原生 GPU）、PaddleOCR（Paddle CPU 版）。
+  - torch CUDA 版是超集，CPU/GPU 都能跑；换回 CPU 版：`pip install torch==2.12.0 torchvision==0.27.0`（默认 PyPI 即 CPU）。
+  - 重装 GPU 版：`pip install --index-url https://download.pytorch.org/whl/cu126 torch==2.12.0 torchvision==0.27.0`（官方源慢/断流时，用 curl 断点续传下 wheel 再本地装）。
+- **人脸边界框矫正（2026-06-24）**：RetinaFace 只给 5 点不含眉毛，不符国标 §3.5。改用 **SPIGA(WFLW 98点)** 量出「眉毛最上沿→颏底线、耳间不含耳」三边。
+  - 封装 `spiga_face_landmarks.py`（含 CPU/GPU 自适应 + 对 SPIGA 写死 cuda 的运行时补丁）；FaceDetector 优先用 SPIGA，失败退回 5 点比例法。
+  - SPIGA 权重 255MB 在 `model_cache\deepface\..`? 实际在 `venv312\Lib\site-packages\spiga\models\weights\spiga_wflw.pt`（gdown 从 Google Drive 下，避开 C 盘）。GPU 热推理 ~0.14s/脸。
+- **模型缓存**：框架权重强制落 `E:\Vehicle_Data_Anonymization_Verifier\model_cache\`（原 C 盘满；现 C 已腾出 500G，但缓存仍留 E）
   - venv 的 pip 缓存也已固定到 E（`venv312\pip.ini`）
 - **车牌权重**：`weights\license_plate_yolov8.pt`（来源 HF `Koushim/yolov8-license-plate-detection`，经 hf-mirror.com 下载）
 
 ### 怎么运行（重要）
 - **不能用 VSCode 默认"运行"按钮**（会用系统 Python 3.14，缺库必报错）。
 - 双击 `.bat` 启动器（在仓库目录，自动用 E 盘 venv）：
-  - `运行_完整流水线_抽帧+检测.bat` ← **主入口**：放好视频后一键抽帧+检测
-  - `运行_脚本2_检测.bat`、`运行_脚本5_自检评测.bat`、`打开_labelme标注.bat`
+  - `运行_检测_选择文件.bat` ← **主入口**（2026-06-25）：弹文件框**勾选照片/视频(可混选、多轮跨文件夹累加)** → 视频抽帧+照片直采 → 脚本二检测。调 `gbt_run_detection.py`，输出到 `detection_result\run_N_时间戳\`。
+  - `运行_脚本5_自检评测.bat`、`打开_labelme标注.bat`
+  - 已删旧 bat：`运行_完整流水线_抽帧+检测.bat`/`运行_脚本2_检测.bat`/`运行_脚本2_照片检测.bat`（被统一入口取代；连带 `_find_latest_run.py`/`_make_run_dir.py` 已无用）。
 - 或终端用全路径：`E:\...\venv312\Scripts\python.exe 脚本.py`
 - **数据规格**：所有样本统一使用 **1080p 视频**抽帧（之前用的 1707px 图片不再使用）
 - 标注工具 **labelme 6.3.1** 已装进 venv，真值 `.json` 默认存图片旁。
 
-### 自检目录结构（方案A，数据均在仓库外，不入库）
+### 测试目录结构（数据均在仓库外，不入库）— 2026-06-23 改名：self_check→test、unmasked→sample
 ```
 E:\Vehicle_Data_Anonymization_Verifier\
-├─ self_check\                 自检总目录（阶段一）
-│  ├─ unmasked\                未打码（考核项1~5）
+├─ test\                       测试总目录
+│  ├─ sample\                  未打码样本
 │  │  ├─ video\                视频源 → 脚本一抽帧
-│  │  └─ images\               待检图片（脚本二读这里）+ labelme真值.json存图片旁
-│  ├─ masked\                  已打码（项6~7，先留空，结构同 unmasked）
-│  │  ├─ video\  └─ images\
-│  ├─ detection_json\          脚本二输出（+ visualization\ 框图）
+│  │  └─ image\                ★直接放照片处（脚本二照片直检读这里）+ labelme真值.json存图片旁
+│  ├─ masked\                  已打码（项6~7，结构 video\ + images\）
+│  ├─ detection_result\        ★脚本二输出：run_N_时间戳\{images,json,visualization}
+│  ├─ detection_json\          脚本二默认输出（无参时）/ 脚本五读取
 │  └─ report\                  脚本五自检报告
 ├─ model_cache\  venv312\  Vehicle_Data_Anonymization_Verifier\(代码仓库)
 ```
-流水线：`unmasked\video` →[脚本一]→ `unmasked\images` →[脚本二]→ `detection_json`；
-        在 `unmasked\images` 上用 labelme 标注 → [脚本五] 比对出 `report\self_check_report.json`。
-- 试水：5~10 张未打码图直接丢 `unmasked\images`（不用视频），标注后跑脚本二、脚本五即可。
-- 检已打码图（项6~7）：把脚本二/五里的 `unmasked` 改成 `masked`。
-- 阶段二（正式检测、按客户分目录）：待项目审批、客户数据到位后再设计，当前不建。
+用法（2026-06-25 起统一入口）：
+- **检测（照片/视频混选）**：照片放 `test\sample\image`、视频放 `test\sample\video`（也可放任意处）→ 双击 `运行_检测_选择文件.bat`
+  → 弹框勾选要检测的文件（可多轮跨文件夹累加）→ 视频抽帧+照片直采 → 脚本二检测
+  → 输出 `detection_result\run_N_时间戳\{images\photos, images\<视频名>, json, visualization}`。
+- 自检评测：在 `image` 上用 labelme 标注 → 脚本五比对（GT_DIR/DET_DIR 见脚本五 `__main__`）。
+- 阶段二（正式检测、按客户分目录）：待客户数据到位后再设计，当前不建。
 
 ---
 
